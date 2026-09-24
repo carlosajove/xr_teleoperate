@@ -1,3 +1,4 @@
+import numpy as np
 import time
 import argparse
 from multiprocessing import Value, Array, Lock
@@ -368,6 +369,16 @@ if __name__ == '__main__':
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+
+            # [r1_mujoco local patch] R1 in simulation: let the head (pitch/yaw) follow the headset so the head camera
+            # turns with the operator. Stock xr_teleoperate leaves the R1 head at zero. televuer re-expresses the headset
+            # rotation in the robot basis (similarity transform), so "forward" is the rotated robot x axis: R[:, 0].
+            if args.arm in ("R1_A5", "R1_A7") and args.sim and getattr(tele_data, "head_pose", None) is not None:
+                _f = tele_data.head_pose[:3, 0]
+                _yaw = float(np.arctan2(_f[1], _f[0])); _pitch = float(-np.arcsin(np.clip(_f[2], -1.0, 1.0)))
+                with arm_ctrl.ctrl_lock:
+                    arm_ctrl.msg.motor_cmd[29].q = float(np.clip(_pitch, -0.6, 0.6))   # kHeadPitch
+                    arm_ctrl.msg.motor_cmd[30].q = float(np.clip(_yaw, -1.9, 1.9))     # kHeadYaw
 
             # record data
             if args.record:
