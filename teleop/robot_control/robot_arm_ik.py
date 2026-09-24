@@ -1595,7 +1595,12 @@ class R1_A5_ArmIK:
             self.var_q,
             self.reduced_robot.model.upperPositionLimit)
         )
-        self.opti.minimize(50 * self.translational_cost + 0.5 * self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
+        # [r1_mujoco local patch] R1_IK_SMOOTH=1: down-weight orientation (a 5-DoF arm cannot track the wrist rotation
+        # anyway) and up-weight smoothness so the solution stops jumping between IK branches.
+        if os.getenv("R1_IK_SMOOTH", "0") == "1":
+            self.opti.minimize(50 * self.translational_cost + 0.15 * self.rotation_cost + 0.02 * self.regularization_cost + 0.6 * self.smooth_cost)
+        else:
+            self.opti.minimize(50 * self.translational_cost + 0.5 * self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
 
         opts = {
             # CasADi-level options

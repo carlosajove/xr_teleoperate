@@ -246,6 +246,10 @@ class Brainco_Controller_hand:
     def control_process(self, left_hand_array, right_hand_array, left_hand_state_array, right_hand_state_array,
                               dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None, xr_motion_data_ready_in = None):
         self.running = True
+        # [r1_mujoco local patch] the DDS writers were created in the parent process; after fork() they publish
+        # nothing (observed in simulation: 0 messages on rt/brainco/*/cmd). Re-create them inside this process.
+        self.LeftHandCmb_publisher = ChannelPublisher(kTopicbraincoLeftCommand, MotorCmds_); self.LeftHandCmb_publisher.Init()
+        self.RightHandCmb_publisher = ChannelPublisher(kTopicbraincoRightCommand, MotorCmds_); self.RightHandCmb_publisher.Init()
 
         left_q_target  = np.full(brainco_Num_Motors, 0.0, dtype=float)
         right_q_target = np.full(brainco_Num_Motors, 0.0, dtype=float)
