@@ -67,18 +67,8 @@ class Brainco_Controller_ctrl:
         logger_mp.info("Initialize Brainco_Controller_ctrl OK!\n")
 
     def _subscribe_hand_state(self):
-        while True:
-            left_hand_msg  = self.LeftHandState_subscriber.Read()
-            right_hand_msg = self.RightHandState_subscriber.Read()
-            if left_hand_msg is not None and right_hand_msg is not None:
-                # Update left hand state
-                for idx, id in enumerate(Brainco_Left_Hand_JointIndex):
-                    self.left_hand_state_array[idx] = left_hand_msg.states[id].q
-                # Update right hand state
-                for idx, id in enumerate(Brainco_Right_Hand_JointIndex):
-                    self.right_hand_state_array[idx] = right_hand_msg.states[id].q
-                self.hand_sub_ready = True
-            time.sleep(0.002)
+        # [rpop real-robot patch] same one-hand-tolerant reader as Brainco_Controller_hand (R1 has only the right hand).
+        Brainco_Controller_hand._subscribe_hand_state(self)
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
         """
@@ -217,18 +207,30 @@ class Brainco_Controller_hand:
         logger_mp.info("Initialize Brainco_Controller_hand OK!")
 
     def _subscribe_hand_state(self):
-        while True:
-            left_hand_msg  = self.LeftHandState_subscriber.Read()
-            right_hand_msg = self.RightHandState_subscriber.Read()
-            if left_hand_msg is not None and right_hand_msg is not None:
-                # Update left hand state
-                for idx, id in enumerate(Brainco_Left_Hand_JointIndex):
-                    self.left_hand_state_array[idx] = left_hand_msg.states[id].q
-                # Update right hand state
-                for idx, id in enumerate(Brainco_Right_Hand_JointIndex):
-                    self.right_hand_state_array[idx] = right_hand_msg.states[id].q
-                self.hand_sub_ready = True
-            time.sleep(0.002)
+        # [rpop real-robot patch] R1 may have only one BrainCo hand fitted. Read() blocks until a sample arrives, so each
+        # hand gets its own reader thread; wait up to 3 s for both, then go on with whichever hand reports (the missing
+        # hand's state stays 0 and its commands go unanswered).
+        seen = {"left": False, "right": False}
+        def reader(side, subscriber, joint_index, state_array):
+            while True:
+                msg = subscriber.Read()
+                if msg is not None:
+                    for idx, id in enumerate(joint_index):
+                        state_array[idx] = msg.states[id].q
+                    seen[side] = True
+        for args in (("left", self.LeftHandState_subscriber, Brainco_Left_Hand_JointIndex, self.left_hand_state_array),
+                     ("right", self.RightHandState_subscriber, Brainco_Right_Hand_JointIndex, self.right_hand_state_array)):
+            threading.Thread(target=reader, args=args, daemon=True).start()
+        first_seen = None
+        while not self.hand_sub_ready:
+            if any(seen.values()):
+                first_seen = first_seen or time.time()
+                if all(seen.values()) or time.time() - first_seen > 3.0:
+                    if not all(seen.values()):
+                        side = "left" if seen["left"] else "right"
+                        logger_mp.warning(f"[{type(self).__name__}] only the {side} hand reports; continuing with one hand.")
+                    self.hand_sub_ready = True
+            time.sleep(0.01)
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
         """

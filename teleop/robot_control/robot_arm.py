@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import threading
 import time
 from enum import IntEnum
@@ -1709,7 +1710,9 @@ class R1_A5_ArmController:
         self.kd_head = 1.0
 
         self.all_motor_q = None
-        self.set_arm_velocity_limit()
+        # [rpop real-robot patch] R1_ARM_VEL_LIMIT (rad/s): stock 30 rad/s is effectively no limit on the real arms.
+        self.set_arm_velocity_limit(float(os.getenv("R1_ARM_VEL_LIMIT", "2.0")))
+        logger_mp.info(f"[R1_A5_ArmController] arm velocity limit {self.arm_velocity_limit:.2f} rad/s")
         self.control_dt = 1.0 / 250.0
 
         if self.motion_mode:
@@ -1735,7 +1738,9 @@ class R1_A5_ArmController:
         self.msg = unitree_hg_msg_dds__LowCmd_()
         # R1/R1-A5 arm_sdk uses mode_pr as a percentage weight.  This differs from
         # G1/H1_2, which use an otherwise notused joint command as the weight.
-        self.msg.mode_pr = 100 if self.motion_mode else 0
+        # [rpop real-robot patch] start at weight 0; ctrl_head_and_waist_go_home ramps it to 100 % over arm_sdk_ramp_time.
+        self.msg.mode_pr = 0
+        self.arm_sdk_ramp_time = 2.0
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
@@ -1783,6 +1788,9 @@ class R1_A5_ArmController:
             self.msg.motor_cmd[id].dq = 0.0
             self.msg.motor_cmd[id].tau = 0.0
         logger_mp.info("R1 A5 joint commands initialized.")
+
+        # [rpop real-robot patch] hold the current arm pose until tracking starts (stock: zeros -> arms jump to home).
+        self.q_target = self.get_current_dual_arm_q()
 
         # Head and available waist joints gradually return to zero at startup.
         self.ctrl_head_and_waist_go_home()
@@ -1842,6 +1850,8 @@ class R1_A5_ArmController:
         start_waist_q = self.all_motor_q[[id.value for id in waist_indices]]
         steps = max(1, int(duration / self.control_dt))
         for step in range(1, steps + 1):
+            if self.motion_mode:
+                self._set_arm_sdk_weight(step * self.control_dt / self.arm_sdk_ramp_time)
             scale = 1.0 - step / steps
             head_q = start_head_q * scale
             waist_q = start_waist_q * scale
@@ -1852,6 +1862,8 @@ class R1_A5_ArmController:
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
             time.sleep(self.control_dt)
+        if self.motion_mode:
+            self._set_arm_sdk_weight(1.0)
         logger_mp.info("[R1_A5_ArmController] head and waist return to zero OK!")
 
     def _ctrl_motor_state(self):

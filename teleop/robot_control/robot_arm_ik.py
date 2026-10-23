@@ -1567,15 +1567,20 @@ class R1_A5_ArmIK:
                 )
             ],
         )
+        # [rpop real-robot patch] R1_IK_ROLL_ONLY=1: the 5-DoF arm has no wrist pitch/yaw, so a full 3-axis orientation
+        # cost lets unreachable wrist bends leak into wrist roll and the shoulder. Keep only the twist about the forearm
+        # (ee local x = wrist roll axis), expressed in the ee frame.
+        self.roll_only = os.getenv("R1_IK_ROLL_ONLY", "0") == "1"
+        if self.roll_only:
+            rot_err_l = cpin.log3(self.cdata.oMf[self.L_hand_id].rotation.T @ self.cTf_l[:3,:3])[0]
+            rot_err_r = cpin.log3(self.cdata.oMf[self.R_hand_id].rotation.T @ self.cTf_r[:3,:3])[0]
+        else:
+            rot_err_l = cpin.log3(self.cdata.oMf[self.L_hand_id].rotation @ self.cTf_l[:3,:3].T)
+            rot_err_r = cpin.log3(self.cdata.oMf[self.R_hand_id].rotation @ self.cTf_r[:3,:3].T)
         self.rotational_error = casadi.Function(
             "rotational_error",
             [self.cq, self.cTf_l, self.cTf_r],
-            [
-                casadi.vertcat(
-                    cpin.log3(self.cdata.oMf[self.L_hand_id].rotation @ self.cTf_l[:3,:3].T),
-                    cpin.log3(self.cdata.oMf[self.R_hand_id].rotation @ self.cTf_r[:3,:3].T)
-                )
-            ],
+            [casadi.vertcat(rot_err_l, rot_err_r)],
         )
 
         # Defining the optimization problem
@@ -1597,7 +1602,22 @@ class R1_A5_ArmIK:
         )
         # [r1_mujoco local patch] R1_IK_SMOOTH=1: down-weight orientation (a 5-DoF arm cannot track the wrist rotation
         # anyway) and up-weight smoothness so the solution stops jumping between IK branches.
-        if os.getenv("R1_IK_SMOOTH", "0") == "1":
+        if self.roll_only:
+            rot_w = float(os.getenv("R1_IK_ROLL_WEIGHT", "2.0"))
+            # [rpop real-robot patch] R1_IK_POINT_WEIGHT>0: also make the forearm (= hand pointing direction, the arm has
+            # no wrist bend) follow the operator's hand x axis. Position (3) + pointing (2) uses all 5 arm DoF, so the
+            # twist becomes best-effort. Error = 1 - cos(angle) between ee and target x axes.
+            point_w = float(os.getenv("R1_IK_POINT_WEIGHT", "0"))
+            point_cost = 0
+            if point_w > 0:
+                point_err = casadi.Function(
+                    "point_error", [self.cq, self.cTf_l, self.cTf_r],
+                    [casadi.vertcat(1 - casadi.dot(self.cdata.oMf[self.L_hand_id].rotation[:, 0], self.cTf_l[:3, 0]),
+                                    1 - casadi.dot(self.cdata.oMf[self.R_hand_id].rotation[:, 0], self.cTf_r[:3, 0]))])
+                point_cost = casadi.sum1(point_err(self.var_q, self.param_tf_l, self.param_tf_r))
+            self.opti.minimize(50 * self.translational_cost + rot_w * self.rotation_cost + point_w * point_cost
+                               + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
+        elif os.getenv("R1_IK_SMOOTH", "0") == "1":
             self.opti.minimize(50 * self.translational_cost + 0.15 * self.rotation_cost + 0.02 * self.regularization_cost + 0.6 * self.smooth_cost)
         else:
             self.opti.minimize(50 * self.translational_cost + 0.5 * self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
@@ -1702,6 +1722,18 @@ class R1_A5_ArmIK:
         self.opti.set_initial(self.var_q, self.init_data)
 
         # left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
+        # [rpop real-robot patch] R1_ARM_SCALE: the operator's arm is longer than R1's (reach ~0.55 m), so 1:1 targets sit
+        # at the edge of the workspace and the robot arm stays nearly straight. Scale each wrist target about its shoulder.
+        arm_scale = float(os.getenv("R1_ARM_SCALE", "1.0"))
+        if arm_scale != 1.0:
+            if not hasattr(self, "_shoulder_pos"):
+                model, data = self.reduced_robot.model, self.reduced_robot.data
+                pin.forwardKinematics(model, data, pin.neutral(model))
+                self._shoulder_pos = {side: data.oMi[model.getJointId(f"{side}_shoulder_pitch_joint")].translation.copy()
+                                      for side in ("left", "right")}
+            left_wrist, right_wrist = left_wrist.copy(), right_wrist.copy()
+            for wrist, side in ((left_wrist, "left"), (right_wrist, "right")):
+                wrist[:3, 3] = self._shoulder_pos[side] + arm_scale * (wrist[:3, 3] - self._shoulder_pos[side])
         if self.Visualization:
             self.vis.viewer['L_ee_target'].set_transform(left_wrist)   # for visualization
             self.vis.viewer['R_ee_target'].set_transform(right_wrist)  # for visualization
@@ -1729,6 +1761,23 @@ class R1_A5_ArmIK:
 
             if self.Visualization:
                 self.vis.display(sol_q)  # for visualization
+
+            # [rpop real-robot patch] R1_IK_DEBUG=1: twice a second log the right-hand target vs where the IK solution puts
+            # the hand, and how far the target is from the right shoulder (R1 reach is about 0.55 m).
+            if os.getenv("R1_IK_DEBUG", "0") == "1" and time.time() - getattr(self, "_dbg_t", 0.0) > 0.5:
+                self._dbg_t = time.time()
+                model, data = self.reduced_robot.model, self.reduced_robot.data
+                pin.framesForwardKinematics(model, data, sol_q)
+                reached = data.oMf[self.R_hand_id].translation
+                target = right_wrist[:3, 3]
+                shoulder = data.oMi[next(i for i, n in enumerate(model.names) if "right_shoulder" in n.lower())].translation
+                Rt, Re = right_wrist[:3, :3], data.oMf[self.R_hand_id].rotation
+                twist_err = np.degrees(pin.log3(Re.T @ Rt)[0])
+                point_err = np.degrees(np.arccos(np.clip(Re[:, 0] @ Rt[:, 0], -1.0, 1.0)))
+                logger_mp.info(f"[R1_IK_DEBUG] R target {np.round(target, 3)} reached {np.round(reached, 3)} "
+                               f"err {np.linalg.norm(target - reached):.3f} m | target-shoulder {np.linalg.norm(target - shoulder):.3f} m"
+                               f" | tx {np.round(Rt[:, 0], 2)} ty {np.round(Rt[:, 1], 2)} | ex {np.round(Re[:, 0], 2)} ey {np.round(Re[:, 1], 2)}"
+                               f" | wrist_roll {sol_q[9]:+.2f} | twist_err {twist_err:+.0f} deg point_err {point_err:.0f} deg")
 
             return sol_q, sol_tauff
 

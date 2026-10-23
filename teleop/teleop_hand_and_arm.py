@@ -140,8 +140,11 @@ if __name__ == '__main__':
                                      )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
+        # [rpop real-robot patch] R1: controllers drive arms/hands only; leg commands from the thumbsticks need
+        # R1_CONTROLLER_LOCO=1 (stock G1 LocoClient, unverified on R1).
+        controller_loco = os.getenv("R1_CONTROLLER_LOCO", "0") == "1" or args.arm not in ("R1_A5", "R1_A7")
         if args.motion:
-            if args.input_mode == "controller":
+            if args.input_mode == "controller" and controller_loco:
                 loco_wrapper = LocoClientWrapper()
         else:
             motion_switcher = MotionSwitcher()
@@ -351,11 +354,14 @@ if __name__ == '__main__':
                 if tele_data.right_ctrl_aButton:
                     START = False
                     STOP = True
+                if not controller_loco:
+                    pass
                 # command robot to enter damping mode. soft emergency stop function
-                if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
-                    loco_wrapper.Damp()
+                elif tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
+                    loco_wrapper.Enter_Damp_Mode()
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
-                loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
+                else:
+                    loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
                                   -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
                                   -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
 
@@ -373,12 +379,21 @@ if __name__ == '__main__':
             # [r1_mujoco local patch] R1 in simulation: let the head (pitch/yaw) follow the headset so the head camera
             # turns with the operator. Stock xr_teleoperate leaves the R1 head at zero. televuer re-expresses the headset
             # rotation in the robot basis (similarity transform), so "forward" is the rotated robot x axis: R[:, 0].
-            if args.arm in ("R1_A5", "R1_A7") and args.sim and getattr(tele_data, "head_pose", None) is not None:
+            # [rpop real-robot patch] R1_HEAD_FOLLOW=1 enables the same on the real robot, rate-limited to R1_HEAD_VEL_LIMIT
+            # (rad/s, default 1.5) and yaw clipped to +-R1_HEAD_YAW_MAX (rad, default 1.2; URDF +-2.0). Pitch +-0.6 (URDF +-0.63).
+            _head_follow = args.sim or (os.getenv("R1_HEAD_FOLLOW", "0") == "1" and args.motion)
+            if args.arm in ("R1_A5", "R1_A7") and _head_follow and getattr(tele_data, "head_pose", None) is not None:
                 _f = tele_data.head_pose[:3, 0]
                 _yaw = float(np.arctan2(_f[1], _f[0])); _pitch = float(-np.arcsin(np.clip(_f[2], -1.0, 1.0)))
+                _yaw_max = 1.9 if args.sim else float(os.getenv("R1_HEAD_YAW_MAX", "1.2"))
+                _target = np.array([np.clip(_pitch, -0.6, 0.6), np.clip(_yaw, -_yaw_max, _yaw_max)])
                 with arm_ctrl.ctrl_lock:
-                    arm_ctrl.msg.motor_cmd[29].q = float(np.clip(_pitch, -0.6, 0.6))   # kHeadPitch
-                    arm_ctrl.msg.motor_cmd[30].q = float(np.clip(_yaw, -1.9, 1.9))     # kHeadYaw
+                    if not args.sim:
+                        _prev = np.array([arm_ctrl.msg.motor_cmd[29].q, arm_ctrl.msg.motor_cmd[30].q])
+                        _step = float(os.getenv("R1_HEAD_VEL_LIMIT", "1.5")) / args.frequency
+                        _target = _prev + np.clip(_target - _prev, -_step, _step)
+                    arm_ctrl.msg.motor_cmd[29].q = float(_target[0])   # kHeadPitch
+                    arm_ctrl.msg.motor_cmd[30].q = float(_target[1])   # kHeadYaw
 
             # record data
             if args.record:
