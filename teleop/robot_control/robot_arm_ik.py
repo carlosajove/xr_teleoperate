@@ -1724,16 +1724,31 @@ class R1_A5_ArmIK:
         # left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
         # [rpop real-robot patch] R1_ARM_SCALE: the operator's arm is longer than R1's (reach ~0.55 m), so 1:1 targets sit
         # at the edge of the workspace and the robot arm stays nearly straight. Scale each wrist target about its shoulder.
+        # R1_PROFILE (json from r1_teleop/calibrate.py) + R1_INPUT_MODE: per-operator shoulder and scale instead,
+        # target = robot_shoulder + k * (wrist - operator_shoulder).
+        if not hasattr(self, "_shoulder_pos"):
+            model, data = self.reduced_robot.model, self.reduced_robot.data
+            pin.forwardKinematics(model, data, pin.neutral(model))
+            self._shoulder_pos = {side: data.oMi[model.getJointId(f"{side}_shoulder_pitch_joint")].translation.copy()
+                                  for side in ("left", "right")}
+            self._profile = None
+            if os.getenv("R1_PROFILE"):
+                import json
+                mode = os.getenv("R1_INPUT_MODE", "hand")
+                prof = json.load(open(os.getenv("R1_PROFILE")))
+                if mode not in prof.get("modes", {}):
+                    raise ValueError(f"[R1_A5_ArmIK] profile {prof.get('name')} has no '{mode}' calibration")
+                self._profile = {side: (np.array(v["shoulder_op"]), float(v["scale"])) for side, v in prof["modes"][mode].items()
+                                 if side in ("left", "right")}
+                logger_mp.info(f"[R1_A5_ArmIK] operator profile {prof.get('name')} ({mode}): scale "
+                               f"L {self._profile['left'][1]:.2f} R {self._profile['right'][1]:.2f}")
+        raw_right = right_wrist[:3, 3].copy()
         arm_scale = float(os.getenv("R1_ARM_SCALE", "1.0"))
-        if arm_scale != 1.0:
-            if not hasattr(self, "_shoulder_pos"):
-                model, data = self.reduced_robot.model, self.reduced_robot.data
-                pin.forwardKinematics(model, data, pin.neutral(model))
-                self._shoulder_pos = {side: data.oMi[model.getJointId(f"{side}_shoulder_pitch_joint")].translation.copy()
-                                      for side in ("left", "right")}
+        if self._profile is not None or arm_scale != 1.0:
             left_wrist, right_wrist = left_wrist.copy(), right_wrist.copy()
             for wrist, side in ((left_wrist, "left"), (right_wrist, "right")):
-                wrist[:3, 3] = self._shoulder_pos[side] + arm_scale * (wrist[:3, 3] - self._shoulder_pos[side])
+                shoulder_op, k = self._profile[side] if self._profile else (self._shoulder_pos[side], arm_scale)
+                wrist[:3, 3] = self._shoulder_pos[side] + k * (wrist[:3, 3] - shoulder_op)
         if self.Visualization:
             self.vis.viewer['L_ee_target'].set_transform(left_wrist)   # for visualization
             self.vis.viewer['R_ee_target'].set_transform(right_wrist)  # for visualization
@@ -1762,6 +1777,21 @@ class R1_A5_ArmIK:
             if self.Visualization:
                 self.vis.display(sol_q)  # for visualization
 
+            # [rpop real-robot patch] R1_IK_LOG=<file.csv>: every solve, right arm: raw and scaled target, target rotation,
+            # reached position, measured and solved joints, twist/pointing error. For offline analysis of real sessions.
+            if os.getenv("R1_IK_LOG"):
+                if not hasattr(self, "_ik_log"):
+                    self._ik_log = open(os.getenv("R1_IK_LOG"), "w", buffering=1)
+                    self._ik_log.write("t,raw_x,raw_y,raw_z,tgt_x,tgt_y,tgt_z," + ",".join(f"R{i}{j}" for i in range(3) for j in range(3))
+                                       + ",ee_x,ee_y,ee_z," + ",".join(f"qmeas{i}" for i in range(10)) + ","
+                                       + ",".join(f"qsol{i}" for i in range(10)) + ",twist_err_deg,point_err_deg\n")
+                model, data = self.reduced_robot.model, self.reduced_robot.data
+                pin.framesForwardKinematics(model, data, sol_q)
+                Re, Rt = data.oMf[self.R_hand_id].rotation, right_wrist[:3, :3]
+                qm = current_lr_arm_motor_q if current_lr_arm_motor_q is not None else np.full(10, np.nan)
+                row = [time.time(), *raw_right, *right_wrist[:3, 3], *Rt.ravel(), *data.oMf[self.R_hand_id].translation, *qm, *sol_q,
+                       np.degrees(pin.log3(Re.T @ Rt)[0]), np.degrees(np.arccos(np.clip(Re[:, 0] @ Rt[:, 0], -1.0, 1.0)))]
+                self._ik_log.write(f"{row[0]:.3f}," + ",".join(f"{v:.5g}" for v in row[1:]) + "\n")
             # [rpop real-robot patch] R1_IK_DEBUG=1: twice a second log the right-hand target vs where the IK solution puts
             # the hand, and how far the target is from the right shoulder (R1 reach is about 0.55 m).
             if os.getenv("R1_IK_DEBUG", "0") == "1" and time.time() - getattr(self, "_dbg_t", 0.0) > 0.5:
